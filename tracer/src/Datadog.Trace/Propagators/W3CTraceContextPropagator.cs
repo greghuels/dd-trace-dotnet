@@ -199,9 +199,6 @@ namespace Datadog.Trace.Propagators
                     sb.Length--;
                 }
 
-                // OTel consistent-probability-sampling sub-keys ("ot=rv:...;th:..."), placed
-                // immediately after "dd=" so both survive right-side truncation of a crowded
-                // tracestate (W3C permits dropping members past 32).
                 var otelTraceState = context.OtelTraceState;
 
                 if (!string.IsNullOrWhiteSpace(otelTraceState))
@@ -329,19 +326,36 @@ namespace Datadog.Trace.Propagators
                 return new W3CTraceState(samplingPriority: null, origin: null, lastParent: ZeroLastParent, propagatedTags: null, additionalValues: null, otTraceState: null);
             }
 
+#if NETCOREAPP
+            SplitTraceStateValues(header.AsSpan().Trim(), out var ddValues, out var otTraceState, out var hasOtTraceState, out var additionalValues, out var combinedAdditionalValues);
+#else
             SplitTraceStateValues(header!, out var ddValues, out var otTraceState, out var additionalValues);
+#endif
 
+#if NETCOREAPP
+            if (ddValues.Length < 3)
+#else
             if (ddValues is null or { Length: < 3 })
+#endif
             {
                 // "dd" section not found or it is too short
                 // shortest valid length is 3 as in "a:b" ("dd=" prefix already stripped)
                 // note for this case the p will be viewed as 0 if added as a span tag
+#if NETCOREAPP
+                return new W3CTraceState(samplingPriority: null, origin: null, lastParent: ZeroLastParent, propagatedTags: null, combinedAdditionalValues ?? (additionalValues.IsEmpty ? null : additionalValues.ToString()), hasOtTraceState ? otTraceState.ToString() : null);
+#else
                 return new W3CTraceState(samplingPriority: null, origin: null, lastParent: ZeroLastParent, propagatedTags: null, additionalValues, otTraceState);
+#endif
             }
 
             int? samplingPriority = null;
+#if NETCOREAPP
+            ReadOnlySpan<char> origin = default;
+            ReadOnlySpan<char> lastParent = default;
+#else
             string? origin = null;
             string? lastParent = null;
+#endif
             var propagatedTagsBuilder = StringBuilderCache.Acquire();
 
             try
@@ -361,6 +375,12 @@ namespace Datadog.Trace.Propagators
                     }
 
                     // search for next separator semicolon
+#if NETCOREAPP
+                    var endIndex = ddValues[startIndex..].IndexOf(TraceStateDatadogPairsSeparator);
+                    endIndex = endIndex < 0 ? ddValues.Length : startIndex + endIndex;
+                    var colonIndex = ddValues[startIndex..endIndex].IndexOf(TraceStateDatadogKeyValueSeparator);
+                    colonIndex = colonIndex < 0 ? -1 : startIndex + colonIndex;
+#else
                     var endIndex = ddValues.IndexOf(TraceStateDatadogPairsSeparator, startIndex);
 
                     if (endIndex < 0)
@@ -371,6 +391,7 @@ namespace Datadog.Trace.Propagators
                     }
 
                     var colonIndex = ddValues.IndexOf(TraceStateDatadogKeyValueSeparator, startIndex, endIndex - startIndex);
+#endif
 
                     if (colonIndex <= startIndex || endIndex - 1 <= colonIndex)
                     {
@@ -384,8 +405,8 @@ namespace Datadog.Trace.Propagators
                     }
 
 #if NETCOREAPP
-                    var name = ddValues.AsSpan(start: startIndex, length: colonIndex - startIndex);
-                    var value = ddValues.AsSpan(start: colonIndex + 1, length: endIndex - colonIndex - 1);
+                    var name = ddValues.Slice(start: startIndex, length: colonIndex - startIndex);
+                    var value = ddValues.Slice(start: colonIndex + 1, length: endIndex - colonIndex - 1);
 
                     if (name.Equals(TraceStateSamplingPriorityKey, StringComparison.Ordinal))
                     {
@@ -394,11 +415,11 @@ namespace Datadog.Trace.Propagators
                     }
                     else if (name.Equals(TraceStateOriginKey, StringComparison.Ordinal))
                     {
-                        origin = value.ToString();
+                        origin = value;
                     }
                     else if (name.Equals(TraceStateLastParentKey, StringComparison.Ordinal))
                     {
-                        lastParent = value.ToString();
+                        lastParent = value;
                     }
                     else if (name.StartsWith(PropagatedTagPrefix, StringComparison.Ordinal))
                     {
@@ -461,15 +482,79 @@ namespace Datadog.Trace.Propagators
                     propagatedTags = null;
                 }
 
+#if NETCOREAPP
+                return new W3CTraceState(samplingPriority, origin.IsEmpty ? null : origin.ToString(), lastParent.IsEmpty ? ZeroLastParent : lastParent.ToString(), propagatedTags, combinedAdditionalValues ?? (additionalValues.IsEmpty ? null : additionalValues.ToString()), hasOtTraceState ? otTraceState.ToString() : null);
+#else
                 lastParent ??= ZeroLastParent;
 
                 return new W3CTraceState(samplingPriority, origin, lastParent, propagatedTags, additionalValues, otTraceState);
+#endif
             }
             finally
             {
                 StringBuilderCache.Release(propagatedTagsBuilder);
             }
         }
+
+#if NETCOREAPP
+        private static void SplitTraceStateValues(ReadOnlySpan<char> header, out ReadOnlySpan<char> ddValues, out ReadOnlySpan<char> otValues, out bool hasOtValues, out ReadOnlySpan<char> additionalValues, out string? combinedAdditionalValues)
+        {
+            ExtractMember(header, "dd=", out ddValues, out var afterDd, out var combinedAfterDd, out _);
+            ExtractMember(combinedAfterDd is null ? afterDd : combinedAfterDd.AsSpan(), "ot=", out otValues, out additionalValues, out combinedAdditionalValues, out hasOtValues);
+        }
+
+        private static void ExtractMember(ReadOnlySpan<char> header, ReadOnlySpan<char> prefix, out ReadOnlySpan<char> value, out ReadOnlySpan<char> remainder, out string? combinedRemainder, out bool found)
+        {
+            var startIndex = 0;
+
+            while (!header[startIndex..].StartsWith(prefix, StringComparison.Ordinal))
+            {
+                var separatorIndex = header[startIndex..].IndexOf(TraceStateHeaderValuesSeparator);
+
+                if (separatorIndex < 0)
+                {
+                    value = default;
+                    remainder = header;
+                    combinedRemainder = null;
+                    found = false;
+                    return;
+                }
+
+                startIndex += separatorIndex + 1;
+            }
+
+            var endIndex = header[(startIndex + prefix.Length)..].IndexOf(TraceStateHeaderValuesSeparator);
+            endIndex = endIndex < 0 ? header.Length : startIndex + prefix.Length + endIndex;
+
+            value = header[(startIndex + prefix.Length)..endIndex];
+            found = true;
+
+            if (startIndex == 0 && endIndex == header.Length)
+            {
+                remainder = default;
+                combinedRemainder = null;
+            }
+            else if (startIndex == 0)
+            {
+                remainder = header[(endIndex + 1)..];
+                combinedRemainder = null;
+            }
+            else if (endIndex == header.Length)
+            {
+                remainder = header[..(startIndex - 1)];
+                combinedRemainder = null;
+            }
+            else
+            {
+                var left = header[..(startIndex - 1)];
+                var right = header[(endIndex + 1)..];
+                var sb = StringBuilderCache.Acquire(left.Length + right.Length + 1);
+                sb.Append(left).Append(TraceStateHeaderValuesSeparator).Append(right);
+                combinedRemainder = StringBuilderCache.GetStringAndRelease(sb);
+                remainder = default;
+            }
+        }
+#endif
 
         internal static void SplitTraceStateValues(string header, out string? ddValues, out string? otValues, out string? additionalValues)
         {
