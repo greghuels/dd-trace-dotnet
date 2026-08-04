@@ -63,29 +63,48 @@ void EventPipeEventsManager::ParseEvent(
         return;
     }
 
-    // Now that the BCL events are also received through EventPipe, it is needed to know which provider is sending each event.
-    // It is possible to get the provider name from ICorProfilerInfo::EventPipeGetProviderInfo but the characters will
-    // be copied each time an event is received: this could have a perf impact.
-    // If this is the case, we could use the undocumented implementation details behind the EVENTPIPE_PROVIDER pointer
-    // to the internal _EventPipeProvider structure from ep-provider.h:
-    //    struct _EventPipeProvider {
-    //        // Bit vector containing the currently enabled keywords.
-    //        int64_t keywords;
-    //        // Bit mask of sessions for which this provider is enabled.
-    //        uint64_t sessions;
-    //        // The name of the provider.
-    //        ep_char8_t* provider_name;
-    //        ep_char16_t* provider_name_utf16;
-    // so the provider ANSI name is at offset 16 from the "provider" pointer
+    // Identify which provider emitted the event. EventPipeGetProviderInfo copies the
+    // provider name on every call, and the string comparisons below used to run on every
+    // single event delivered on the EventPipe processing thread. Under allocation-heavy
+    // workloads the GC event rate is high, so this fixed per-event cost dominated. The
+    // provider pointer is stable, so the resolved type is cached (see GetProviderType).
+    DotnetEventsProvider dotnetProvider = GetProviderType(provider);
+
+    // Also, during the test, a last (keyword=0 id=1 V1) event is sent from "Microsoft-DotNETCore-EventPipe"
+    if (dotnetProvider == DotnetEventsProvider::Clr)
+    {
+        // The events are expected to be processed synchronously so the current time is used as timestamp
+        _clrParser->ParseEvent(OpSysTools::GetHighPrecisionTimestamp(), version, keywords, id, cbEventData, eventData);
+    }
+    else
+    if (dotnetProvider != DotnetEventsProvider::Unknown)
+    {
+        // The events are expected to be processed synchronously so the current time is used as timestamp
+        _bclParser->ParseEvent(dotnetProvider, provider, OpSysTools::GetHighPrecisionTimestamp(), version, keywords, id, eventData, cbEventData, pActivityId, pRelatedActivityId, eventThread);
+    }
+}
+
+DotnetEventsProvider EventPipeEventsManager::GetProviderType(EVENTPIPE_PROVIDER provider)
+{
+    auto found = _providerTypes.find(provider);
+    if (found != _providerTypes.end())
+    {
+        return found->second;
+    }
+
+    // First time we see this provider pointer: resolve its name once and cache the result.
+    // It is possible to get the provider name from ICorProfilerInfo::EventPipeGetProviderInfo
+    // but the characters are copied on each call, so we only do it on a cache miss.
+    DotnetEventsProvider dotnetProvider = DotnetEventsProvider::Unknown;
+
     ULONG nameLength = 256;
     WCHAR providerName[256];
     HRESULT hr = _pCorProfilerInfo->EventPipeGetProviderInfo(provider, nameLength, &nameLength, providerName);
     if (FAILED(hr))
     {
-        return;
+        // Do not cache a failed lookup: the provider pointer may become resolvable later.
+        return DotnetEventsProvider::Unknown;
     }
-
-    DotnetEventsProvider dotnetProvider = DotnetEventsProvider::Unknown;
 
     // CLR events: "Microsoft-Windows-DotNETRuntime"
     if (WStrCmp(providerName, WStr("Microsoft-Windows-DotNETRuntime")) == 0)
@@ -117,18 +136,15 @@ void EventPipeEventsManager::ParseEvent(
         dotnetProvider = DotnetEventsProvider::NetSecurity;
     }
 
-    // Also, during the test, a last (keyword=0 id=1 V1) event is sent from "Microsoft-DotNETCore-EventPipe"
-    if (dotnetProvider == DotnetEventsProvider::Clr)
+    // Keep the cache bounded (providers may be re-created over the process
+    // lifetime); drop it wholesale if we somehow exceed the small cap.
+    if (_providerTypes.size() >= MaxCachedProviders)
     {
-        // The events are expected to be processed synchronously so the current time is used as timestamp
-        _clrParser->ParseEvent(OpSysTools::GetHighPrecisionTimestamp(), version, keywords, id, cbEventData, eventData);
+        _providerTypes.clear();
     }
-    else
-    if (dotnetProvider != DotnetEventsProvider::Unknown)
-    {
-        // The events are expected to be processed synchronously so the current time is used as timestamp
-        _bclParser->ParseEvent(dotnetProvider, provider, OpSysTools::GetHighPrecisionTimestamp(), version, keywords, id, eventData, cbEventData, pActivityId, pRelatedActivityId, eventThread);
-    }
+
+    _providerTypes[provider] = dotnetProvider;
+    return dotnetProvider;
 }
 
 bool EventPipeEventsManager::TryGetEventInfo(LPCBYTE pMetadata, ULONG cbMetadata, WCHAR*& name, DWORD& id, INT64& keywords, DWORD& version)
