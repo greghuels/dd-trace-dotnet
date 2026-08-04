@@ -122,4 +122,6 @@ private:
     std::thread _worker;
     std::atomic<bool> _stopRequested;
     AutoResetEvent _event;
+    // Only enabled in CI
+    bool _isCiVisibilityEnabled;
 };

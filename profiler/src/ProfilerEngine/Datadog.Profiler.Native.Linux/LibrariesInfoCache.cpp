@@ -152,7 +152,8 @@ LibrariesInfoCache::LibrariesInfoCache(IConfiguration* configuration, shared::pm
     _newSymbols{_wrappersAllocator},
 #endif
     _stopRequested{false},
-    _event(true)
+    _event(true),
+    _isCiVisibilityEnabled(configuration->IsCIVisibilityEnabled())
 {
     if (_tracker)
     {
@@ -188,11 +189,16 @@ bool LibrariesInfoCache::StartImpl()
     // before setting s_instance and registering with libunwind.
     // Cache population can be slow under sanitizers (ASAN/UBSAN add overhead to
     // every allocation and memory access) — use a longer timeout in that case.
+
+    constexpr auto defaultStartTimeout = 2s;
+    constexpr auto ciStartTimeout = 10s;
+
 #if defined(DD_SANITIZERS)
-    constexpr auto startTimeout = 10s;
+    auto const startTimeout = ciStartTimeout;
 #else
-    constexpr auto startTimeout = 2s;
+    auto const startTimeout = _isCiVisibilityEnabled ? ciStartTimeout : defaultStartTimeout;
 #endif
+
     if (!startEvent->Wait(startTimeout))
     {
         Log::Error("Failed to populate LibrariesInfoCache within timeout. "
